@@ -1,3 +1,4 @@
+import os
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Tokenizer
 from exllamav2.architecture import RopeStyle
 import argparse, os, shutil
@@ -18,6 +19,7 @@ parser.add_argument("-res", "--resume", action = "store_true", help = "Resume jo
 parser.add_argument("-nr", "--no_resume", action = "store_true", help = "Do not resume an interrupted job (deletes all files in the output directory)")
 parser.add_argument("-cf", "--compile_full", type = str, help = "Output folder for compiled model with all config/tokenizer files")
 parser.add_argument("-c", "--cal_dataset", type = str, help = "Calibration dataset (.parquet file)")
+parser.add_argument("-cdf", "--code_factor", type = float, help = "Factor to adjust the use of code and technical data for calibration (2.0: to double)", default = 1.0)
 parser.add_argument("-b", "--bits", type = float, default = 4.125, help = "Target bits per weight")
 parser.add_argument("-ss", "--shard_size", type = float, help = "Max shard size in MB (default: 8192)", default = 8192)
 parser.add_argument("-rs", "--rope_scale", type = float, help = "RoPE scaling factor")
@@ -32,12 +34,17 @@ parser.add_argument("-ml", "--measurement_length", type = int, default = 2048, h
 parser.add_argument("-so", "--status_output", action = "store_true", help = "Include machine-parseable status updates in console output")
 parser.add_argument("-hsol", "--hidden_state_offload_layers", type = int, default = 0, help = "Number of hidden/target states to keep in VRAM. Speed-up but increases VRAM usage")
 parser.add_argument("-fst", "--fast_safetensors", action = "store_true", help = "Deprecated (does nothing)")
+#parser.add_argument("-gpu", "--gpu", type = int, help = "Select GPU to run quantization on (use single integer, no multi-GPU support)", default = -1)
 
 args = parser.parse_args()
 
 torch.set_printoptions(precision = 7, sci_mode = False, linewidth = 200)
 
 # Check some args
+
+#if args.gpu >= 0:
+#    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+#    torch.cuda.set_device(args.gpu)
 
 resuming = False
 if args.out_dir:
@@ -54,6 +61,13 @@ if not args.in_dir and not resuming:
 
 if args.length > 2048 or args.measurement_length > 2048:
     print(" !! Warning: calibration rows > 2048 tokens may result in excessive VRAM use")
+
+def is_pow_2(x):
+    return bool(x > 0 and (x & (x - 1)) == 0)
+
+if not (is_pow_2(args.length) or args.length > 2048) or not is_pow_2(args.measurement_length):
+    print(" ## Error: calibration context length has to be a power of 2")
+    sys.exit()
 
 if not args.head_bits in qparams_headoptions:
     print(f" ## Error: {args.head_bits} is not a supported option for head layer bitrate")
@@ -74,6 +88,13 @@ if not os.path.exists(args.out_dir):
         print(f" ## Error: Failed to create output directory: {args.out_dir}")
         print(f"    {str(e)}")
         sys.exit()
+
+if args.code_factor > 4.0:
+    print(f" !! Warning: code_factor maxed out at 4.0")
+    args.code_factor = 4.0
+elif args.code_factor < 0.5:
+    print(f" !! Warning: code_factor hit min at 0.5")
+    args.code_factor = 0.5
 
 # Create job
 
@@ -107,6 +128,7 @@ if output_measurement is not None:
 job = {"in_dir": args.in_dir,
        "out_dir": args.out_dir,
        "cal_dataset": args.cal_dataset,
+       "code_factor": args.code_factor,
        "bits": args.bits,
        "dataset_rows": args.dataset_rows,
        "measurement_rows": args.measurement_rows,
@@ -169,6 +191,8 @@ else:
 
 if job['rope_scale']: print(f" -- RoPE scale: {job['rope_scale']:.2f}")
 if job['rope_alpha']: print(f" -- RoPE alpha: {job['rope_alpha']:.2f}")
+
+if job['code_factor']: print(f" -- Code factor: {job['code_factor']:.2f}")
 
 # Make sure subfolders exist
 
@@ -287,7 +311,8 @@ while True:
 
         print(f" -- Tokenizing samples...")
         noise_rows = config.arch.standard_calib_noise
-        tokenize(job, save_job, tokenizer, noise_rows = noise_rows)
+        code_factor = job["code_factor"]
+        tokenize(job, save_job, tokenizer, noise_rows = noise_rows, code_factor = code_factor)
         job["progress"] = "embeddings"
         save_job()
 
@@ -314,8 +339,3 @@ while True:
     if progress == "finished": break
 
 print(f" -- Finished")
-
-
-
-
-
